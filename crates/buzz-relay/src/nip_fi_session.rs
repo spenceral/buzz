@@ -199,6 +199,7 @@ pub(crate) fn spawn_nip_fi_expiry_task(
         let terminal = || {
             control.deny_authorization(&terminal_ctrl_tx, route);
             metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
+            crate::nip_fi_shadow::record_session_end(route.shadow_label(), "expired");
             warn!(
                 route = ?route,
                 "NIP-FI session lease expired — closing connection"

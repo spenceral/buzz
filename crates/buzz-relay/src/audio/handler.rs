@@ -138,6 +138,12 @@ pub async fn ws_audio_handler(
     // The tenant lookup awaited since the community resolved; a snapshot
     // that went stale meanwhile accepts no socket.
     if let Err(class) = nip_fi_deadline.check() {
+        crate::nip_fi_upgrade::record_stale(
+            crate::nip_fi_session::NipFiWsRoute::Audio,
+            crate::nip_fi_shadow::enforce_label(&state, raw_host),
+            nip_fi_assertion.as_ref(),
+            class,
+        );
         return crate::nip_fi_core::http_denial(class).into_response();
     }
     let shadow_assertion = crate::nip_fi_upgrade::observe_deadline(
@@ -779,6 +785,12 @@ async fn run_active_audio_connection(
     .await
         == crate::nip_fi_session::PairingOutcome::Denied
     {
+        crate::nip_fi_shadow::record_pairing_denial(
+            "audio",
+            crate::nip_fi_shadow::enforce_label(&state, tenant.host()),
+            nip_fi_assertion.as_ref(),
+            pubkey,
+        );
         return;
     }
 
@@ -818,6 +830,11 @@ async fn run_active_audio_connection(
                     channel_id = %channel_id,
                     pubkey = %pubkey_hex,
                     "NIP-FI deny-set hit at audio post-registration check — denying"
+                );
+                crate::nip_fi_shadow::record_denial(
+                    "audio",
+                    crate::nip_fi_shadow::enforce_label(&state, tenant.host()),
+                    crate::nip_fi_shadow::DENY_SET.by(Some(pubkey)),
                 );
                 deny_audio_authorization(&mut ws_send, &control, &mut terminal_ctrl_rx).await;
                 return;

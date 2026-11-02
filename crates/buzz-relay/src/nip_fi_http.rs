@@ -376,6 +376,17 @@ where
     }
 
     let community = resolve_for_admission(communities, headers).await;
+    // Every denial names the verified NIP-98 key, as shadow's does.
+    let signed = std::cell::Cell::new(None);
+    let extract_nip98 = || {
+        let proof = extract_nip98();
+        signed.set(proof.as_ref().ok().filter(|p| p.signed).map(|p| p.pubkey));
+        proof
+    };
+    let record = |deny: WouldDeny| {
+        let label = crate::nip_fi_shadow::label(&community);
+        crate::nip_fi_shadow::record_denial("http", label, deny.by(signed.get()));
+    };
     let (proof, assertion) = evaluate_enforce_steps(
         headers,
         community.as_deref(),
@@ -384,6 +395,7 @@ where
         extract_nip98,
     )
     .map_err(|deny| {
+        record(deny);
         let reason = match deny.stage {
             Stage::Pairing => Some("nip_fi_http_key_mismatch"),
             Stage::DenySet => Some("nip_fi_http_denied_pubkey"),
@@ -397,7 +409,14 @@ where
     // The handler may have awaited (tenant lookup) since the guard resolved
     // the community; a snapshot that went stale meanwhile admits nothing.
     if let Ok(community) = &community {
-        community.deadline().check().map_err(http_denial)?;
+        community.deadline().check().map_err(|class| {
+            record(WouldDeny::new(
+                Stage::Deadline,
+                class,
+                crate::nip_fi_shadow::STALE,
+            ));
+            http_denial(class)
+        })?;
     }
 
     // Step 8: admit.
@@ -1343,6 +1362,41 @@ mod tests {
                  pairing branch removal would cause this panic"
             ),
         }
+    }
+
+    // HTTP admission records enforce's refusal once, naming the verified
+    // NIP-98 key, else `absent`. Mutations: dropping the `record` call, or
+    // attributing an unsigned proof → RED.
+    #[tokio::test(flavor = "current_thread")]
+    async fn enforce_http_denial_is_recorded_with_the_signed_key() {
+        use crate::nip_fi_core::test_support::TEST_COMMUNITY_URI;
+        use crate::nip_fi_shadow::tests::{enforce_count, enforce_records};
+        let signer = nostr::Keys::generate().public_key();
+        let verifier = ScriptedVerifier::new(Ok(Some(nostr::Keys::generate().public_key())));
+        let mut headers = host_headers();
+        headers.insert(
+            CLIENT_ATTACHED_HEADER,
+            HeaderValue::from_static("Bearer any.valid.looking.token"),
+        );
+        let ((), lines, counts) = enforce_records(async {
+            let map = communities();
+            let verifier = Some(&verifier as &dyn VerifyAssertion);
+            let mode = NipFiMode::Enforce;
+            let deny = &AlwaysAdmitStubDenyMap;
+            let signed = || Ok(Nip98Proof::new(signer, ()));
+            let unsigned = || Ok(Nip98Proof::unsigned(signer, ()));
+            let _ = admit_stateless(&headers, signed, &map, verifier, mode, deny).await;
+            let _ = admit_stateless(&headers, unsigned, &map, verifier, mode, deny).await;
+        })
+        .await;
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains(&format!("pubkey=\"{}\"", signer.to_hex())),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("pubkey=\"absent\""), "{lines:?}");
+        let pairing = enforce_count(["http", "pairing", "denied", TEST_COMMUNITY_URI]);
+        assert_eq!(counts, [pairing.clone(), pairing]);
     }
 
     // ── R3 regression: Authorization cardinality ─────────────────────────────

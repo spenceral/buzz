@@ -25,6 +25,8 @@
 //! | Series | Labels | One increment per |
 //! |---|---|---|
 //! | `buzz_nip_fi_shadow_total` | `route` (`http`, `ws`, `audio`), `stage`, `outcome`, `community` | NIP-FI decision enforce would make: one per HTTP request that reaches admission, one per WebSocket upgrade enforce would refuse, and one per observed session: at the AUTH where enforce would admit or deny it, or `deadline` when its deadline passes first. A request or upgrade whose community binding goes stale before enforce's final re-check also records `deadline`. An agent assertion enforce would refuse for its token owner, banned or not the agent's stored owner, records `owner` |
+//! | `buzz_nip_fi_enforce_denied_total` | as `buzz_nip_fi_shadow_total` | NIP-FI denial enforce returns: at the upgrade (community, assertion, deny set, stale binding), at the router guard and HTTP admission, and at AUTH (pairing, post-registration deny set). Its line is `nip-fi enforce deny`, written at once |
+//! | `buzz_nip_fi_enforce_session_end_total` | `route` (`ws`, `audio`), `reason` (`expired`) | enforce session its deadline closed. Its line is `nip-fi enforce session end` |
 //! | `buzz_nip_fi_shadow_strict_proof_total` | `route` (`bridge`, `blossom`), `outcome` (`pass`, `rejected`), `community` | strict NIP-98 side check on a route whose proof is stricter in enforce (payload tag, Blossom proof); not every request runs one |
 //! | `buzz_nip_fi_shadow_session_end_total` | `route` (`ws`, `audio`), `reason` (`expired`, `revoked`), `community` | admitted shadow session enforce would have ended; a session never admitted records none |
 //! | `buzz_nip_fi_shadow_disconnect_total` | `route` (`admin`, `cross_pod`), `outcome` | disconnect-path event that moves a real disconnect counter in enforce: an accepted admin command, a capacity rejection, a subscriber lag, or a cross-pod capacity or poison failsafe. An admin command refused for its header, body, proof, replay, or a dependency error records nothing |
@@ -173,24 +175,91 @@ pub(crate) fn record_pending(
     )
     .increment(1);
     // The counter is the record; only a would-deny earns a line.
-    let deny = verdict.err()?;
-    let line = PendingLine {
+    Some(PendingLine::new(
+        Mode::Shadow,
         route,
-        stage,
-        outcome,
-        reason: deny.reason,
         community,
-        written: std::sync::atomic::AtomicBool::new(false),
+        verdict.err()?,
+    ))
+}
+
+/// Record one denial enforce actually returned, on its own counter with the
+/// labels of `buzz_nip_fi_shadow_total`, and write its line at once with the
+/// key `deny` names, else `absent`. A refused upgrade or guarded request
+/// ends before any later proof, so nothing waits for one.
+pub(crate) fn record_denial(route: &'static str, community: SharedString, deny: WouldDeny) {
+    metrics::counter!(
+        "buzz_nip_fi_shadow_total",
+        "route" => route,
+        "stage" => deny.stage.label(),
+        "outcome" => class_label(deny.class),
+        "community" => community.clone()
+    )
+    .increment(1);
+    PendingLine::new(Mode::Enforce, route, community, deny).finish();
+}
+
+/// Record an admitted enforce session its deadline ended, as
+/// `buzz_nip_fi_shadow_session_end_total` records the one shadow would end.
+pub(crate) fn record_session_end(route: &'static str, reason: &'static str) {
+    metrics::counter!(
+        "buzz_nip_fi_enforce_session_end_total",
+        "route" => route,
+        "reason" => reason
+    )
+    .increment(1);
+    tracing::info!(
+        mode = "enforce",
+        route,
+        reason,
+        "nip-fi enforce session end"
+    );
+}
+
+/// [`record_denial`] for enforce's key-pairing refusal of `pubkey`, the
+/// NIP-42 key proven against `assertion`.
+pub(crate) fn record_pairing_denial(
+    route: &'static str,
+    community: SharedString,
+    assertion: Option<&buzz_auth::VerifiedAssertion>,
+    pubkey: PublicKey,
+) {
+    let reason = if assertion.and_then(|a| a.asserted_key()).is_some() {
+        "key_mismatch"
+    } else {
+        "no_asserted_key"
     };
-    if let Some(key) = deny.pubkey {
-        line.prove(key);
+    let deny = WouldDeny::new(Stage::Pairing, DenialClass::AuthorizationDenied, reason);
+    record_denial(route, community, deny.by(Some(pubkey)));
+}
+
+/// The `community` label of an enforce denial after the upgrade, from the
+/// connection's bound Host: as [`crate::nip_fi_core::ResolvedCommunity`]
+/// labels it, the configured URI for an `env` community, else `bound`.
+pub(crate) fn enforce_label(state: &crate::state::AppState, host: &str) -> SharedString {
+    let nip_fi = &state.config.nip_fi;
+    match nip_fi.source {
+        crate::nip_fi_config::CommunitySource::Database => SharedString::const_str(BOUND),
+        crate::nip_fi_config::CommunitySource::Env => nip_fi
+            .communities
+            .resolve(host)
+            .map_or(SharedString::const_str(UNMAPPED), |binding| {
+                binding.expected_aud().to_owned().into()
+            }),
     }
-    Some(line)
+}
+
+/// Whether a line records shadow's would-deny or enforce's denial.
+#[derive(Clone, Copy)]
+enum Mode {
+    Shadow,
+    Enforce,
 }
 
 /// A counted would-deny's info line, written exactly once: by the first key
 /// proven for it, else as `absent` when finished or dropped.
 pub(crate) struct PendingLine {
+    mode: Mode,
     route: &'static str,
     stage: &'static str,
     outcome: &'static str,
@@ -200,6 +269,22 @@ pub(crate) struct PendingLine {
 }
 
 impl PendingLine {
+    fn new(mode: Mode, route: &'static str, community: SharedString, deny: WouldDeny) -> Self {
+        let line = Self {
+            mode,
+            route,
+            stage: deny.stage.label(),
+            outcome: class_label(deny.class),
+            reason: deny.reason,
+            community,
+            written: std::sync::atomic::AtomicBool::new(false),
+        };
+        if let Some(key) = deny.pubkey {
+            line.prove(key);
+        }
+        line
+    }
+
     /// Write the line for `pubkey`, a key the client proved, unless it is
     /// already written.
     pub(crate) fn prove(&self, pubkey: PublicKey) {
@@ -215,15 +300,30 @@ impl PendingLine {
         if self.written.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
-        tracing::info!(
-            route = self.route,
-            stage = self.stage,
-            outcome = self.outcome,
-            reason = self.reason,
-            pubkey,
-            community = %self.community,
-            "nip-fi shadow would-deny"
-        );
+        // Both lines stay in this module: production's log filter admits
+        // `buzz_relay::nip_fi_shadow` at info.
+        match self.mode {
+            Mode::Shadow => tracing::info!(
+                mode = "shadow",
+                route = self.route,
+                stage = self.stage,
+                outcome = self.outcome,
+                reason = self.reason,
+                pubkey,
+                community = %self.community,
+                "nip-fi shadow would-deny"
+            ),
+            Mode::Enforce => tracing::info!(
+                mode = "enforce",
+                route = self.route,
+                stage = self.stage,
+                outcome = self.outcome,
+                reason = self.reason,
+                pubkey,
+                community = %self.community,
+                "nip-fi enforce deny"
+            ),
+        }
     }
 }
 
@@ -574,12 +674,129 @@ pub(crate) mod tests {
 
         /// The would-deny lines logged so far.
         pub(crate) fn lines(&self) -> Vec<String> {
+            self.lines_of("nip-fi shadow would-deny")
+        }
+
+        /// The enforce denial lines logged so far.
+        pub(crate) fn enforce_lines(&self) -> Vec<String> {
+            self.lines_of("nip-fi enforce deny")
+        }
+
+        fn lines_of(&self, message: &str) -> Vec<String> {
             let log = String::from_utf8(self.out.0.lock().unwrap().clone()).unwrap();
             log.lines()
-                .filter(|l| l.contains("nip-fi shadow would-deny"))
+                .filter(|l| l.contains(message))
                 .map(str::to_owned)
                 .collect()
         }
+    }
+
+    /// What enforce recorded while running `body`: its denial lines and the
+    /// `(route, stage, outcome, community)` of every
+    /// `buzz_nip_fi_enforce_denied_total` increment. Fails if `body` touched
+    /// the shadow counter.
+    pub(crate) async fn enforce_records<F: std::future::Future>(
+        body: F,
+    ) -> (F::Output, Vec<String>, Vec<[String; 4]>) {
+        let recorder = DebuggingRecorder::new();
+        let log = WouldDenyLog::capture();
+        let output = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            body.await
+        };
+        let mut counts = Vec::new();
+        for (key, _, _, value) in recorder.snapshotter().snapshot().into_vec() {
+            let key = key.key();
+            assert_ne!(
+                key.name(),
+                "buzz_nip_fi_shadow_total",
+                "enforce counted as shadow"
+            );
+            if key.name() != "buzz_nip_fi_enforce_denied_total" {
+                continue;
+            }
+            assert_shadow_schema(key);
+            let label = |name| {
+                key.labels()
+                    .find(|l| l.key() == name)
+                    .map_or("-", |l| l.value())
+                    .to_owned()
+            };
+            let DebugValue::Counter(n) = value else {
+                unreachable!()
+            };
+            for _ in 0..n {
+                counts.push(["route", "stage", "outcome", "community"].map(label));
+            }
+        }
+        counts.sort();
+        (output, log.enforce_lines(), counts)
+    }
+
+    /// `[route, stage, outcome, community]` as owned labels.
+    pub(crate) fn enforce_count(labels: [&str; 4]) -> [String; 4] {
+        labels.map(str::to_owned)
+    }
+
+    // Mutations: counting on `buzz_nip_fi_shadow_total`, logging the shadow
+    // message or `mode`, skipping the immediate write, or logging below info
+    // → RED.
+    #[tokio::test(flavor = "current_thread")]
+    async fn enforce_denial_counts_its_own_series_and_logs_once_at_info() {
+        use super::{Stage, WouldDeny};
+        use buzz_auth::DenialClass;
+        let key = nostr::Keys::generate().public_key();
+        let ((), lines, counts) = enforce_records(async {
+            let pairing = WouldDeny::new(
+                Stage::Pairing,
+                DenialClass::AuthorizationDenied,
+                "key_mismatch",
+            );
+            super::record_denial("ws", super::BOUND.into(), pairing.by(Some(key)));
+            let missing = WouldDeny::assertion(crate::nip_fi_core::AssertionRejection::Transport(
+                DenialClass::MissingEvidence,
+            ));
+            super::record_denial("http", super::BOUND.into(), missing);
+        })
+        .await;
+        let log = lines.join("\n");
+        assert_eq!(lines.len(), 2, "{log}");
+        assert!(lines.iter().all(|l| l.contains(" INFO ")
+            && l.contains("mode=\"enforce\"")
+            && !l.contains("would-deny")));
+        assert!(lines[0].contains("reason=\"key_mismatch\""), "{log}");
+        assert!(
+            lines[0].contains(&format!("pubkey=\"{}\"", key.to_hex())),
+            "{log}"
+        );
+        assert!(lines[1].contains("reason=\"missing_assertion\""), "{log}");
+        assert!(lines[1].contains("pubkey=\"absent\""), "{log}");
+        assert_eq!(
+            counts,
+            [
+                enforce_count(["http", "assertion", "missing", "bound"]),
+                enforce_count(["ws", "pairing", "denied", "bound"]),
+            ]
+        );
+    }
+
+    // The deny-set refusal names the asserted key; an assertion without one
+    // stays `absent`. Mutation: deriving the pairing reason from the proven
+    // key instead of the assertion → RED.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pairing_denial_reason_follows_the_assertion() {
+        let key = nostr::Keys::generate().public_key();
+        let other =
+            buzz_auth::VerifiedAssertion::new_for_test(nostr::Keys::generate().public_key());
+        let claimless = buzz_auth::VerifiedAssertion::for_test(None, vec![chrono::Utc::now()]);
+        let ((), lines, counts) = enforce_records(async {
+            super::record_pairing_denial("audio", super::BOUND.into(), Some(&other), key);
+            super::record_pairing_denial("audio", super::BOUND.into(), Some(&claimless), key);
+        })
+        .await;
+        assert!(lines[0].contains("reason=\"key_mismatch\""), "{lines:?}");
+        assert!(lines[1].contains("reason=\"no_asserted_key\""), "{lines:?}");
+        assert_eq!(counts.len(), 2);
     }
 
     /// The counted line of a `route` upgrade would-deny for a missing

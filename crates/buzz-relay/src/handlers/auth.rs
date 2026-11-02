@@ -462,6 +462,12 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             .await
                 == crate::nip_fi_session::PairingOutcome::Denied
             {
+                crate::nip_fi_shadow::record_pairing_denial(
+                    "ws",
+                    crate::nip_fi_shadow::enforce_label(&state, conn.tenant.host()),
+                    conn.nip_fi_assertion.as_ref(),
+                    pubkey,
+                );
                 return;
             }
 
@@ -719,6 +725,22 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                         ?link,
                         "agent owner could not be linked, denying"
                     );
+                    if token_owner.is_some() && conn.nip_fi_assertion.is_some() {
+                        let reason = match link {
+                            crate::api::relay_members::OwnerLink::Conflict => "not_stored_owner",
+                            _ => "owner_link_unavailable",
+                        };
+                        let deny = crate::nip_fi_shadow::WouldDeny::new(
+                            crate::nip_fi_shadow::Stage::Owner,
+                            denial.class,
+                            reason,
+                        );
+                        crate::nip_fi_shadow::record_denial(
+                            "ws",
+                            crate::nip_fi_shadow::enforce_label(&state, conn.tenant.host()),
+                            deny.by(Some(pubkey)),
+                        );
+                    }
                     deny_admission(&conn, &event_id_hex, denial);
                     return;
                 }
@@ -815,6 +837,11 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                             "reason" => "deny_set_post_registration"
                         )
                         .increment(1);
+                        crate::nip_fi_shadow::record_denial(
+                            "ws",
+                            crate::nip_fi_shadow::enforce_label(&state, conn.tenant.host()),
+                            crate::nip_fi_shadow::DENY_SET.by(Some(pubkey)),
+                        );
                         deny_nip_fi_auth(&conn, buzz_auth::DenialClass::AuthorizationDenied);
                         return;
                     }
@@ -1102,8 +1129,20 @@ mod tests {
             .sign_with_keys(&key_b)
             .unwrap();
 
-        // Drive the production handle_auth path.
-        handle_auth(auth_event, Arc::clone(&conn), state).await;
+        // Drive the production handle_auth path. Enforce records the
+        // refusal once, naming the proven key. Mutation: dropping the
+        // pairing `record_pairing_denial` call → RED.
+        let ((), lines, counts) = crate::nip_fi_shadow::tests::enforce_records(handle_auth(
+            auth_event,
+            Arc::clone(&conn),
+            state,
+        ))
+        .await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let proven = format!("pubkey=\"{}\"", key_b.public_key().to_hex());
+        assert!(lines[0].contains(&proven), "{lines:?}");
+        assert_eq!(counts.len(), 1, "{counts:?}");
+        assert_eq!(counts[0][..3], ["ws", "pairing", "denied"]);
 
         assert!(
             cancel.is_cancelled(),
