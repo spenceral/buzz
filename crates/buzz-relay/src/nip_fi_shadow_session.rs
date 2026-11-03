@@ -264,15 +264,22 @@ impl ShadowSession {
 /// One AUTH attempt, audio's through its join commit: refused, or dropped,
 /// while the session is still pending, it ended unadmitted for a non-NIP-FI
 /// reason (NIP-42 failure, ordinary policy refusal), so the session retires
-/// without a record.
-pub(crate) struct AuthAttempt<'a>(pub(crate) Option<&'a Arc<ShadowSession>>);
+/// without a record. Both the shadow and the enforce session retire.
+pub(crate) struct AuthAttempt<'a>(&'a crate::state::CommunityConnectionControl);
 
-impl AuthAttempt<'_> {
+impl<'a> AuthAttempt<'a> {
+    pub(crate) fn new(control: &'a crate::state::CommunityConnectionControl) -> Self {
+        Self(control)
+    }
+
     /// Retires a pending session where the refusal is decided, before the
     /// refusal's frames and cleanup are awaited.
     pub(crate) fn refused(&self) {
-        if let Some(session) = self.0 {
+        if let Some(session) = self.0.nip_fi_shadow() {
             session.retire_pending();
+        }
+        if let Some(session) = self.0.nip_fi_enforce() {
+            session.retire();
         }
     }
 }

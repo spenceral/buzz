@@ -396,6 +396,7 @@ pub(crate) async fn handle_connection(
     let control = CommunityConnectionControl::new(cancel);
     if let Some(assertion) = &nip_fi_assertion {
         control.attach_nip_fi_enforce(crate::nip_fi_shadow::EnforceSession::new(
+            "ws",
             crate::nip_fi_shadow::enforce_label(&state, tenant.host()),
             assertion.asserted_key(),
         ));

@@ -142,23 +142,20 @@ impl CommunityConnectionControl {
         }
     }
 
-    /// Labels the socket's enforced NIP-FI session for its expiry record.
+    /// Attaches the socket's enforced NIP-FI lifecycle.
     pub(crate) fn attach_nip_fi_enforce(&self, session: crate::nip_fi_shadow::EnforceSession) {
         let _ = self.nip_fi_enforce.set(session);
     }
 
-    /// Marks the enforced session admitted for `pubkey`.
-    pub(crate) fn admit_nip_fi_enforce(&self, pubkey: nostr::PublicKey) {
-        if let Some(session) = self.nip_fi_enforce.get() {
-            session.admit(pubkey);
-        }
+    /// The socket's enforced NIP-FI lifecycle, if it was upgraded under one.
+    pub(crate) fn nip_fi_enforce(&self) -> Option<&crate::nip_fi_shadow::EnforceSession> {
+        self.nip_fi_enforce.get()
     }
 
-    /// Records the enforced session's deadline: a pending session's denial,
-    /// else an admitted session's end.
-    pub(crate) fn record_nip_fi_expiry(&self, route: &'static str) {
-        if let Some(session) = self.nip_fi_enforce.get() {
-            session.expire(route);
+    /// Records a NIP-FI refusal of the pending enforced session.
+    pub(crate) fn deny_nip_fi_enforce(&self, deny: crate::nip_fi_shadow::WouldDeny) {
+        if let Some(session) = self.nip_fi_enforce() {
+            session.deny(deny);
         }
     }
 
@@ -465,7 +462,11 @@ impl CommunityConnectionRegistry {
                 .and_then(|v| v.as_ref().map(|id| id.matches(issuer, pubkey)))
                 .unwrap_or(false);
             if matches {
-                entry.value().1.disconnect_nip_fi();
+                let control = &entry.value().1;
+                if let Some(session) = control.nip_fi_enforce() {
+                    session.revoke();
+                }
+                control.disconnect_nip_fi();
                 closed += 1;
             }
         }
@@ -979,6 +980,9 @@ impl ConnectionManager {
                 .unwrap_or(false);
             if matches {
                 // Winner-only enqueue on the terminal channel, then cancel.
+                if let Some(session) = entry.community_control.nip_fi_enforce() {
+                    session.revoke();
+                }
                 entry
                     .community_control
                     .manager_disconnect_nip_fi(&entry.terminal_ctrl_tx);

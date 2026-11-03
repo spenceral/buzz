@@ -3379,6 +3379,7 @@ mod sec005_postgres_tests {
     fn durable_ban_denies_git_even_with_otherwise_valid_auth() {
         let restriction = buzz_db::moderation::RestrictionState {
             banned: true,
+            own_banned: true,
             muted_until: None,
         };
 
@@ -3389,6 +3390,7 @@ mod sec005_postgres_tests {
     fn timeout_without_ban_does_not_revoke_git_access() {
         let restriction = buzz_db::moderation::RestrictionState {
             banned: false,
+            own_banned: false,
             muted_until: Some(chrono::Utc::now()),
         };
 
@@ -3398,6 +3400,7 @@ mod sec005_postgres_tests {
     fn restriction(banned: bool) -> buzz_db::moderation::RestrictionState {
         buzz_db::moderation::RestrictionState {
             banned,
+            own_banned: banned,
             muted_until: None,
         }
     }

@@ -3874,6 +3874,7 @@ mod tests {
                 key.clone(),
                 buzz_db::moderation::RestrictionState {
                     banned: true,
+                    own_banned: true,
                     muted_until: None,
                 },
             );
@@ -3887,6 +3888,7 @@ mod tests {
                 key,
                 buzz_db::moderation::RestrictionState {
                     banned: false,
+                    own_banned: false,
                     muted_until: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
                 },
             );
@@ -3949,6 +3951,7 @@ mod tests {
                 (tenant.community(), user.public_key().to_bytes().to_vec()),
                 buzz_db::moderation::RestrictionState {
                     banned: true,
+                    own_banned: true,
                     muted_until: None,
                 },
             );

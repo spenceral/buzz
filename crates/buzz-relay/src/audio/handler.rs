@@ -274,6 +274,7 @@ pub(crate) async fn handle_audio_connection(
     let control = CommunityConnectionControl::new(cancel);
     if let Some(assertion) = &nip_fi_assertion {
         control.attach_nip_fi_enforce(crate::nip_fi_shadow::EnforceSession::new(
+            "audio",
             crate::nip_fi_shadow::enforce_label(&state, tenant.host()),
             assertion.asserted_key(),
         ));
@@ -704,7 +705,7 @@ async fn run_active_audio_connection(
     #[cfg(test)]
     crate::nip_fi_test_hooks::before_auth_verify(tenant.community()).await;
     // Every exit before the join commit leaves the shadow session unadmitted.
-    let shadow_attempt = crate::nip_fi_shadow_session::AuthAttempt(control.nip_fi_shadow());
+    let shadow_attempt = crate::nip_fi_shadow_session::AuthAttempt::new(&control);
 
     let auth_ctx = tokio::select! {
         biased;
@@ -791,12 +792,6 @@ async fn run_active_audio_connection(
     .await
         == crate::nip_fi_session::PairingOutcome::Denied
     {
-        crate::nip_fi_shadow::record_pairing_denial(
-            "audio",
-            crate::nip_fi_shadow::enforce_label(&state, tenant.host()),
-            nip_fi_assertion.as_ref(),
-            pubkey,
-        );
         return;
     }
 
@@ -811,6 +806,9 @@ async fn run_active_audio_connection(
                 pubkey = %pubkey_hex,
                 "NIP-FI session deadline already expired at pairing — rejecting audio admission"
             );
+            if let Some(session) = control.nip_fi_enforce() {
+                session.expire();
+            }
             deny_audio_authorization(&mut ws_send, &control, &mut terminal_ctrl_rx).await;
             return;
         }
@@ -837,11 +835,7 @@ async fn run_active_audio_connection(
                     pubkey = %pubkey_hex,
                     "NIP-FI deny-set hit at audio post-registration check — denying"
                 );
-                crate::nip_fi_shadow::record_denial(
-                    "audio",
-                    crate::nip_fi_shadow::enforce_label(&state, tenant.host()),
-                    crate::nip_fi_shadow::DENY_SET.by(Some(pubkey)),
-                );
+                control.deny_nip_fi_enforce(crate::nip_fi_shadow::DENY_SET.by(Some(pubkey)));
                 deny_audio_authorization(&mut ws_send, &control, &mut terminal_ctrl_rx).await;
                 return;
             }
@@ -864,7 +858,7 @@ async fn run_active_audio_connection(
     // below rereads bans.
     let early_ban = match token_owner {
         Some(_) => {
-            crate::handlers::auth::community_ban_outcome(
+            crate::handlers::auth::community_ban_verdict(
                 &state,
                 tenant.community(),
                 pubkey,
@@ -875,15 +869,16 @@ async fn run_active_audio_connection(
             )
             .await
         }
-        None => crate::handlers::auth::BanOutcome::Clear,
+        None => crate::handlers::auth::BanVerdict::CLEAR,
     };
-    if let Some(denial) = crate::handlers::auth::ban_admission_denial(early_ban) {
+    if let Some(denial) = crate::handlers::auth::ban_verdict_denial(early_ban) {
+        crate::handlers::auth::record_enforce_refusal(
+            &control,
+            Some(&denial),
+            nip_fi_assertion.as_ref(),
+        );
         shadow_attempt.refused();
         warn!(channel_id = %channel_id, pubkey = %pubkey_hex, reason = denial.reason, "audio: denied at ban check");
-        if nip_fi_assertion.is_some() {
-            crate::handlers::auth::record_owner_ban(&state, &tenant, "audio", pubkey, token_owner)
-                .await;
-        }
         exit_authorization_refusal(
             &mut ws_send,
             &control,
@@ -1010,6 +1005,11 @@ async fn run_active_audio_connection(
         };
         if let Some(denial) = crate::handlers::auth::owner_link_denial(link, token_owner.is_some())
         {
+            crate::handlers::auth::record_enforce_refusal(
+                &control,
+                Some(&denial),
+                nip_fi_assertion.as_ref(),
+            );
             shadow_attempt.refused();
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, owner = %owner.to_hex(), ?link,
                 "audio: agent owner could not be linked, denying");
@@ -1055,6 +1055,11 @@ async fn run_active_audio_connection(
         }
     };
     if let Some(denial) = denial {
+        crate::handlers::auth::record_enforce_refusal(
+            &control,
+            Some(&denial),
+            nip_fi_assertion.as_ref(),
+        );
         shadow_attempt.refused();
         let (class, message) = (denial.class, denial.reason);
         warn!(channel_id = %channel_id, pubkey = %pubkey_hex, reason = message, "audio: denied at final admission check");
@@ -1684,6 +1689,7 @@ async fn run_active_audio_connection(
         // Same-pod joins pass None — room.roster_snapshot() is authoritative there.
         guard.remote_session.as_ref().map(|s| s.roster()),
         control.nip_fi_shadow().map(Arc::as_ref),
+        control.nip_fi_enforce().map(|session| (session, pubkey)),
     )
     .await;
     if committed.is_err() {
@@ -1691,7 +1697,6 @@ async fn run_active_audio_connection(
     }
     match committed {
         Ok(CommitJoinOutcome::JoinedSent(msg)) => {
-            control.admit_nip_fi_enforce(pubkey);
             // Bootstrap prepared inside the permit; assigned here for ordered
             // write to `ctrl_tx` after it is created below, before task spawns.
             bootstrap_joined_msg = msg;
@@ -3292,6 +3297,7 @@ async fn commit_participant_join(
     // Admitted the instant the join commits, before publication awaits;
     // retired at each refusal below, before its rollback awaits.
     shadow: Option<&crate::nip_fi_shadow_session::ShadowSession>,
+    enforce: Option<(&crate::nip_fi_shadow::EnforceSession, nostr::PublicKey)>,
 ) -> Result<CommitJoinOutcome, JoinCommitError> {
     let retire_shadow = || {
         if let Some(shadow) = shadow {
@@ -3542,6 +3548,9 @@ async fn commit_participant_join(
     }
     if let Some(shadow) = shadow {
         shadow.admit();
+    }
+    if let Some((session, pubkey)) = enforce {
+        session.admit(pubkey);
     }
 
     // Fix B (commit-before-publish): call `commit_peer` which atomically
@@ -7867,6 +7876,7 @@ mod tests {
                         &Arc::new(crate::audio::room::Room::new(tenant.community(), channel)),
                         None,
                         None,
+                        None,
                     )
                     .await
                 }
@@ -8520,6 +8530,7 @@ mod tests {
                             )),
                             None,
                             Some(&shadow),
+                            None,
                         )
                         .await
                     };
@@ -8599,6 +8610,7 @@ mod tests {
                     channel_id,
                 )),
                 None, // same-pod test — no owner roster
+                None,
                 None,
             )
             .await;
@@ -8707,6 +8719,7 @@ mod tests {
                     &room,
                     None,
                     None,
+                    None,
                 ),
             )
             .await
@@ -8809,6 +8822,7 @@ mod tests {
                         channel_id,
                     )),
                     None, // same-pod test — no owner roster
+                    None,
                     None,
                 )
                 .await
@@ -9017,6 +9031,7 @@ mod tests {
                     )),
                     None, // same-pod test — no owner roster
                     None,
+                    None,
                 )
                 .await
             });
@@ -9151,6 +9166,7 @@ mod tests {
                         channel_id,
                     )),
                     None, // same-pod test — no owner roster
+                    None,
                     None,
                 )
                 .await
@@ -9290,6 +9306,7 @@ mod tests {
                     )),
                     None, // same-pod test — no owner roster
                     None,
+                    None,
                 )
                 .await
             });
@@ -9334,6 +9351,7 @@ mod tests {
                         channel_id,
                     )),
                     None, // same-pod test — no owner roster
+                    None,
                     None,
                 )
                 .await
@@ -9443,6 +9461,7 @@ mod tests {
                     )),
                     None, // same-pod test — no owner roster
                     None,
+                    None,
                 )
                 .await
             });
@@ -9487,6 +9506,7 @@ mod tests {
                         channel_id,
                     )),
                     None, // same-pod test — no owner roster
+                    None,
                     None,
                 )
                 .await
@@ -9723,6 +9743,7 @@ mod tests {
                     )),
                     None, // same-pod test — no owner roster
                     None,
+                    None,
                 )
                 .await
             });
@@ -9918,6 +9939,7 @@ mod tests {
                         channel_id,
                     )),
                     None, // same-pod test — no owner roster
+                    None,
                     None,
                 )
                 .await
@@ -10484,6 +10506,7 @@ mod tests {
                         channel_id,
                     )),
                     None, // same-pod test — no owner roster
+                    None,
                     None,
                 )
                 .await
@@ -11315,6 +11338,7 @@ mod tests {
                 &room,
                 None, // same-pod test — no owner roster
                 None,
+                None,
             )
             .await;
 
@@ -11440,6 +11464,7 @@ mod tests {
                     &gate2,
                     &room2,
                     None, // same-pod test — no owner roster
+                    None,
                     None,
                 )
                 .await
@@ -11675,6 +11700,7 @@ mod tests {
                 &room,
                 None, // same-pod test — no owner roster
                 None,
+                None,
             )
             .await;
             assert!(
@@ -11847,6 +11873,7 @@ mod tests {
                 &gate,
                 &ingress_room,
                 Some(&owner_snapshot), // cross-pod: use owner-pod roster for the broadcast
+                None,
                 None,
             )
             .await;
@@ -12525,6 +12552,7 @@ mod tests {
                 },
                 &gate,
                 &room,
+                None,
                 None,
                 None,
             )

@@ -66,7 +66,8 @@ fn classify_relay_membership(
 /// `cached` reads the restriction rows through the 30-second ephemeral-path
 /// cache ([`AppState::restriction_state_cached`]); only per-pulse ephemeral
 /// traffic sets it. Socket auth and every other HTTP request read fresh.
-pub(crate) async fn community_ban_outcome(
+/// Returns the outcome with the row that decided it.
+pub(crate) async fn community_ban_verdict(
     state: &AppState,
     community: buzz_core::CommunityId,
     pubkey: nostr::PublicKey,
@@ -74,10 +75,10 @@ pub(crate) async fn community_ban_outcome(
     signed_auth_created_at: Option<u64>,
     token_owner: Option<nostr::PublicKey>,
     cached: bool,
-) -> BanOutcome {
-    let outcome = principal_ban_outcome(state, community, &pubkey, cached).await;
-    if outcome != BanOutcome::Clear {
-        return outcome;
+) -> BanVerdict {
+    let verdict = principal_ban_verdict(state, community, &pubkey, cached).await;
+    if verdict.outcome != BanOutcome::Clear {
+        return verdict;
     }
     // A NIP-FI agent assertion's verified owner cascades unconditionally,
     // whether the agent is a member itself or admitted through that owner.
@@ -89,18 +90,63 @@ pub(crate) async fn community_ban_outcome(
         )
     });
     match owner {
-        Some(owner) => principal_ban_outcome(state, community, &owner, cached).await,
-        None => BanOutcome::Clear,
+        Some(owner) => BanVerdict {
+            outcome: principal_ban_outcome(state, community, &owner, cached).await,
+            source: BanSource::Owner,
+        },
+        None => verdict,
     }
 }
 
-/// Ban verdict for one key, without any owner cascade.
+/// Whose ban row decided a [`BanOutcome`]: the key's own, or an owner's
+/// (its stored agent owner, or the NIP-OA or token owner checked after it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BanSource {
+    Own,
+    Owner,
+}
+
+/// A ban decision with the row that decided it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BanVerdict {
+    pub(crate) outcome: BanOutcome,
+    pub(crate) source: BanSource,
+}
+
+impl BanVerdict {
+    pub(crate) const CLEAR: Self = Self {
+        outcome: BanOutcome::Clear,
+        source: BanSource::Own,
+    };
+
+    /// Shadow's `owner` reason when an owner's row decided the refusal.
+    pub(crate) fn owner_reason(self) -> Option<&'static str> {
+        match (self.source, self.outcome) {
+            (BanSource::Owner, BanOutcome::Banned) => Some("owner_banned"),
+            (BanSource::Owner, BanOutcome::DbError) => Some("owner_ban_unavailable"),
+            _ => None,
+        }
+    }
+}
+
+/// Ban verdict for one key: its own row and its stored agent owner's.
 async fn principal_ban_outcome(
     state: &AppState,
     community: buzz_core::CommunityId,
     key: &nostr::PublicKey,
     cached: bool,
 ) -> BanOutcome {
+    principal_ban_verdict(state, community, key, cached)
+        .await
+        .outcome
+}
+
+async fn principal_ban_verdict(
+    state: &AppState,
+    community: buzz_core::CommunityId,
+    key: &nostr::PublicKey,
+    cached: bool,
+) -> BanVerdict {
     let restriction = if cached {
         state
             .restriction_state_cached(community, key.as_bytes())
@@ -111,14 +157,16 @@ async fn principal_ban_outcome(
             .moderation_restriction_state(community, key.as_bytes())
             .await
     };
-    match restriction {
-        Ok(restriction) if restriction.banned => BanOutcome::Banned,
-        Ok(_) => BanOutcome::Clear,
+    let (outcome, source) = match restriction {
+        Ok(r) if r.banned && !r.own_banned => (BanOutcome::Banned, BanSource::Owner),
+        Ok(r) if r.banned => (BanOutcome::Banned, BanSource::Own),
+        Ok(_) => (BanOutcome::Clear, BanSource::Own),
         Err(e) => {
             warn!(pubkey = %key.to_hex(), error = %e, "ban-state DB lookup failed, denying (fail-closed)");
-            BanOutcome::DbError
+            (BanOutcome::DbError, BanSource::Own)
         }
-    }
+    };
+    BanVerdict { outcome, source }
 }
 
 /// Shadow only: the refusal enforce's token-owner rules would give `agent`,
@@ -150,44 +198,36 @@ pub(crate) async fn token_owner_denial(
     owner_link_denial(link, true).map(|denial| (denial.class, reason))
 }
 
-/// Enforce: record a ban-seam refusal that the token owner's ban caused, as
-/// shadow records `owner`; the agent's own ban is not an owner refusal.
-pub(crate) async fn record_owner_ban(
-    state: &AppState,
-    tenant: &buzz_core::tenant::TenantContext,
-    route: &'static str,
-    agent: nostr::PublicKey,
-    owner: Option<nostr::PublicKey>,
-) {
-    let Some(owner) = owner else {
-        return;
-    };
-    let agent_ban = principal_ban_outcome(state, tenant.community(), &agent, false).await;
-    if agent_ban != BanOutcome::Clear {
-        return;
-    }
-    let ban = principal_ban_outcome(state, tenant.community(), &owner, false).await;
-    if let Some(deny) = owner_ban_deny(ban) {
-        crate::nip_fi_shadow::record_denial(
-            route,
-            crate::nip_fi_shadow::enforce_label(state, tenant.host()),
-            deny.by(Some(agent)),
-        );
-    }
-}
-
-/// The `owner` refusal for a token owner's ban verdict, with shadow's reason.
-fn owner_ban_deny(ban: BanOutcome) -> Option<crate::nip_fi_shadow::WouldDeny> {
-    let denial = ban_admission_denial(ban)?;
-    let reason = match ban {
-        BanOutcome::Banned => "owner_banned",
-        _ => "owner_ban_unavailable",
-    };
-    Some(crate::nip_fi_shadow::WouldDeny::new(
+/// Enforce's `owner` refusal of an agent assertion's key, when `denial` was
+/// decided by its owner: the owner's ban or the owner link.
+pub(crate) fn owner_refusal(
+    denial: &AdmissionDenial,
+    assertion: Option<&buzz_auth::VerifiedAssertion>,
+) -> Option<crate::nip_fi_shadow::WouldDeny> {
+    let assertion = assertion.filter(|a| a.owner().is_some())?;
+    let deny = crate::nip_fi_shadow::WouldDeny::new(
         crate::nip_fi_shadow::Stage::Owner,
         denial.class,
-        reason,
-    ))
+        denial.owner_reason?,
+    );
+    Some(deny.by(assertion.asserted_key()))
+}
+
+/// Claim enforce's verdict for a refused socket before its frames are
+/// awaited: an owner-decided refusal of an agent assertion is recorded with
+/// shadow's `owner` reason; any other refusal retires the session unrecorded.
+pub(crate) fn record_enforce_refusal(
+    control: &crate::state::CommunityConnectionControl,
+    denial: Option<&AdmissionDenial>,
+    assertion: Option<&buzz_auth::VerifiedAssertion>,
+) {
+    let Some(session) = control.nip_fi_enforce() else {
+        return;
+    };
+    match denial.and_then(|d| owner_refusal(d, assertion)) {
+        Some(deny) => session.deny(deny),
+        None => session.retire(),
+    }
 }
 
 fn ban_denial(outcome: BanOutcome) -> Option<(&'static str, &'static str, AuthOutcome)> {
@@ -212,6 +252,17 @@ pub(crate) struct AdmissionDenial {
     pub(crate) reason: &'static str,
     pub(crate) outcome: AuthOutcome,
     pub(crate) class: buzz_auth::DenialClass,
+    /// Shadow's `owner` reason when an agent's owner decided the refusal.
+    pub(crate) owner_reason: Option<&'static str>,
+}
+
+/// [`ban_admission_denial`] carrying the deciding owner, if any.
+pub(crate) fn ban_verdict_denial(verdict: BanVerdict) -> Option<AdmissionDenial> {
+    let denial = ban_admission_denial(verdict.outcome)?;
+    Some(AdmissionDenial {
+        owner_reason: verdict.owner_reason(),
+        ..denial
+    })
 }
 
 /// The refusal for a ban outcome other than [`BanOutcome::Clear`].
@@ -226,6 +277,7 @@ pub(crate) fn ban_admission_denial(ban: BanOutcome) -> Option<AdmissionDenial> {
         reason,
         outcome,
         class,
+        owner_reason: None,
     })
 }
 
@@ -245,7 +297,7 @@ pub(crate) async fn final_admission_denial(
     signed_auth_created_at: Option<u64>,
     token_owner: Option<nostr::PublicKey>,
 ) -> Option<AdmissionDenial> {
-    let ban = community_ban_outcome(
+    let ban = community_ban_verdict(
         state,
         community,
         pubkey,
@@ -255,7 +307,7 @@ pub(crate) async fn final_admission_denial(
         false,
     )
     .await;
-    if let Some(denial) = ban_admission_denial(ban) {
+    if let Some(denial) = ban_verdict_denial(ban) {
         return Some(denial);
     }
     match crate::api::relay_members::check_relay_membership_authoritative(
@@ -273,6 +325,7 @@ pub(crate) async fn final_admission_denial(
             reason: "restricted: not a relay member",
             outcome: AuthOutcome::NotRelayMember,
             class: buzz_auth::DenialClass::AuthorizationDenied,
+            owner_reason: None,
         }),
         Ok(_) => None,
         Err(e) => {
@@ -282,6 +335,7 @@ pub(crate) async fn final_admission_denial(
                 reason: "error: internal error checking relay membership",
                 outcome: AuthOutcome::RelayMembershipCheckError,
                 class: buzz_auth::DenialClass::AuthorizationUnavailable,
+                owner_reason: None,
             })
         }
     }
@@ -319,6 +373,7 @@ pub(crate) async fn admitted_owner(
                 reason: OWNER_LINK_ERROR,
                 outcome: AuthOutcome::RelayMembershipCheckError,
                 class: buzz_auth::DenialClass::AuthorizationUnavailable,
+                owner_reason: None,
             })
         }
     }
@@ -343,12 +398,14 @@ pub(crate) fn owner_link_denial(
             reason: crate::api::relay_members::OWNER_MISMATCH,
             outcome: AuthOutcome::NotRelayMember,
             class: buzz_auth::DenialClass::AuthorizationDenied,
+            owner_reason: Some("not_stored_owner"),
         }),
         OwnerLink::Conflict | OwnerLink::Unavailable => Some(AdmissionDenial {
             metric: "agent_owner_link_error",
             reason: OWNER_LINK_ERROR,
             outcome: AuthOutcome::RelayMembershipCheckError,
             class: buzz_auth::DenialClass::AuthorizationUnavailable,
+            owner_reason: token_owner.then_some("owner_link_unavailable"),
         }),
     }
 }
@@ -390,6 +447,11 @@ fn deny_nip_fi_auth(conn: &ConnectionState, class: buzz_auth::DenialClass) {
 /// the outcome, send the denial (the canonical NOTICE under NIP-FI, else an
 /// OK false on the control channel so it drains before the Close), and close.
 fn deny_admission(conn: &ConnectionState, event_id_hex: &str, denial: AdmissionDenial) {
+    record_enforce_refusal(
+        &conn.community_control,
+        Some(&denial),
+        conn.nip_fi_assertion.as_ref(),
+    );
     metrics::counter!("buzz_auth_failures_total", "reason" => denial.metric).increment(1);
     if !conn.reject_auth(denial.outcome) {
         return;
@@ -471,8 +533,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
         crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &conn.tenant);
     let auth_svc = Arc::clone(&state.auth);
 
-    let _shadow_attempt =
-        crate::nip_fi_shadow_session::AuthAttempt(conn.community_control.nip_fi_shadow());
+    let _shadow_attempt = crate::nip_fi_shadow_session::AuthAttempt::new(&conn.community_control);
     // Pure NIP-42 verification — crypto only, no DB lookups.
     match auth_svc
         .verify_auth_event(event, &challenge, &relay_url)
@@ -502,12 +563,6 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             .await
                 == crate::nip_fi_session::PairingOutcome::Denied
             {
-                crate::nip_fi_shadow::record_pairing_denial(
-                    "ws",
-                    crate::nip_fi_shadow::enforce_label(&state, conn.tenant.host()),
-                    conn.nip_fi_assertion.as_ref(),
-                    pubkey,
-                );
                 return;
             }
 
@@ -537,7 +592,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 // pinning `Failed` for the connection's life on a false premise.
                 // `Banned` claims the ban; `DbError` denies with `error: internal`
                 // (mirrors the ingest write-path gate).
-                let outcome = community_ban_outcome(
+                let verdict = community_ban_verdict(
                     &state,
                     conn.tenant.community(),
                     pubkey,
@@ -547,12 +602,15 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     false,
                 )
                 .await;
+                let outcome = verdict.outcome;
 
                 if let Some((metric_reason, deny_reason, auth_outcome)) = ban_denial(outcome) {
                     warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), reason = deny_reason, "principal denied at ban seam");
-                    if conn.nip_fi_assertion.is_some() {
-                        record_owner_ban(&state, &conn.tenant, "ws", pubkey, token_owner).await;
-                    }
+                    record_enforce_refusal(
+                        &conn.community_control,
+                        ban_verdict_denial(verdict).as_ref(),
+                        conn.nip_fi_assertion.as_ref(),
+                    );
                     metrics::counter!("buzz_auth_failures_total", "reason" => metric_reason)
                         .increment(1);
                     if !conn.reject_auth(auth_outcome) {
@@ -768,22 +826,6 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                         ?link,
                         "agent owner could not be linked, denying"
                     );
-                    if token_owner.is_some() && conn.nip_fi_assertion.is_some() {
-                        let reason = match link {
-                            crate::api::relay_members::OwnerLink::Conflict => "not_stored_owner",
-                            _ => "owner_link_unavailable",
-                        };
-                        let deny = crate::nip_fi_shadow::WouldDeny::new(
-                            crate::nip_fi_shadow::Stage::Owner,
-                            denial.class,
-                            reason,
-                        );
-                        crate::nip_fi_shadow::record_denial(
-                            "ws",
-                            crate::nip_fi_shadow::enforce_label(&state, conn.tenant.host()),
-                            deny.by(Some(pubkey)),
-                        );
-                    }
                     deny_admission(&conn, &event_id_hex, denial);
                     return;
                 }
@@ -844,6 +886,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     reason: "blocked: access revoked",
                     outcome: AuthOutcome::Banned,
                     class: buzz_auth::DenialClass::AuthorizationDenied,
+                    owner_reason: None,
                 }),
                 denial => denial,
             };
@@ -880,11 +923,8 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                             "reason" => "deny_set_post_registration"
                         )
                         .increment(1);
-                        crate::nip_fi_shadow::record_denial(
-                            "ws",
-                            crate::nip_fi_shadow::enforce_label(&state, conn.tenant.host()),
-                            crate::nip_fi_shadow::DENY_SET.by(Some(pubkey)),
-                        );
+                        conn.community_control
+                            .deny_nip_fi_enforce(crate::nip_fi_shadow::DENY_SET.by(Some(pubkey)));
                         deny_nip_fi_auth(&conn, buzz_auth::DenialClass::AuthorizationDenied);
                         return;
                     }
@@ -900,7 +940,9 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 return;
             }
             state.conn_manager.mark_admitted(conn_id);
-            conn.community_control.admit_nip_fi_enforce(pubkey);
+            if let Some(session) = conn.community_control.nip_fi_enforce() {
+                session.admit(pubkey);
+            }
             conn.send(RelayMessage::ok(&event_id_hex, true, ""));
             crate::verified_profiles::admitted(
                 &state,
@@ -1163,6 +1205,14 @@ mod tests {
         });
 
         let state = auth_test_state().await;
+        conn.community_control
+            .attach_nip_fi_enforce(crate::nip_fi_shadow::EnforceSession::new(
+                "ws",
+                crate::nip_fi_shadow::BOUND.into(),
+                conn.nip_fi_assertion
+                    .as_ref()
+                    .and_then(|a| a.asserted_key()),
+            ));
 
         // relay_url = ws://<tenant.host()> where scheme prefix is from config
         // (default ws://), and host is "test.local".
@@ -1174,13 +1224,13 @@ mod tests {
             .unwrap();
 
         // Drive the production handle_auth path. Enforce records the
-        // refusal once, naming the proven key. Mutation: dropping the
-        // pairing `record_pairing_denial` call → RED.
-        let ((), lines, counts) = crate::nip_fi_shadow::tests::enforce_records(handle_auth(
-            auth_event,
-            Arc::clone(&conn),
-            state,
-        ))
+        // refusal once, naming the proven key, and the deadline that fires
+        // after it records nothing more. Mutation: dropping the pairing
+        // seam's `deny_nip_fi_enforce` call → RED.
+        let ((), lines, counts) = crate::nip_fi_shadow::tests::enforce_records(async {
+            handle_auth(auth_event, Arc::clone(&conn), state).await;
+            conn.community_control.nip_fi_enforce().unwrap().expire();
+        })
         .await;
         assert_eq!(lines.len(), 1, "{lines:?}");
         let proven = format!("pubkey=\"{}\"", key_b.public_key().to_hex());
@@ -1800,29 +1850,26 @@ mod tests {
         assert_eq!(records, ["owner/unavailable"]);
     }
 
-    // An owner's ban records `owner` with shadow's reasons; a clear owner
-    // records nothing. Mutation: mapping a ban to another stage or reason → RED.
+    // The deciding row names the reason: an owner's ban or failed lookup is
+    // shadow's `owner` reason, the key's own is none. Mutation: reporting an
+    // own-row ban as the owner's → RED.
     #[test]
-    fn owner_ban_deny_matches_shadow_owner_reasons() {
-        use crate::nip_fi_shadow::{Stage, WouldDeny};
-        use buzz_auth::DenialClass;
-        assert_eq!(super::owner_ban_deny(BanOutcome::Clear), None);
+    fn ban_verdict_owner_reason_follows_the_deciding_row() {
+        use super::{BanSource, BanVerdict};
+        let verdict = |outcome, source| BanVerdict { outcome, source };
         assert_eq!(
-            super::owner_ban_deny(BanOutcome::Banned),
-            Some(WouldDeny::new(
-                Stage::Owner,
-                DenialClass::AuthorizationDenied,
-                "owner_banned"
-            ))
+            verdict(BanOutcome::Banned, BanSource::Owner).owner_reason(),
+            Some("owner_banned")
         );
         assert_eq!(
-            super::owner_ban_deny(BanOutcome::DbError),
-            Some(WouldDeny::new(
-                Stage::Owner,
-                DenialClass::AuthorizationUnavailable,
-                "owner_ban_unavailable"
-            ))
+            verdict(BanOutcome::DbError, BanSource::Owner).owner_reason(),
+            Some("owner_ban_unavailable")
         );
+        assert_eq!(
+            verdict(BanOutcome::Banned, BanSource::Own).owner_reason(),
+            None
+        );
+        assert_eq!(BanVerdict::CLEAR.owner_reason(), None);
     }
 
     const HOUR: chrono::Duration = chrono::Duration::hours(1);

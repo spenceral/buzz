@@ -419,7 +419,11 @@ where
         })?;
     }
 
-    // Step 8: admit.
+    // Step 8: admit. An agent token's admission ends at its owner step,
+    // which records it (`enforce_membership`).
+    if assertion.owner().is_none() {
+        crate::nip_fi_shadow::record_admit("http", &crate::nip_fi_shadow::label(&community));
+    }
     Ok(NipFiAdmission {
         proven_pubkey: proof.pubkey,
         assertion: Some(assertion),
