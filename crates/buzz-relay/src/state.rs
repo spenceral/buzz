@@ -247,10 +247,14 @@ impl CommunityConnectionControl {
     /// registered by `set_terminal_frame_sender`.  Every writer therefore
     /// yields the same single frame plus the reason's 1008 close.
     /// Does not cancel.  [FI-TRACE-DENIAL-ORACLE]
+    /// `enforce` is the NIP-FI end this transition records on the socket's
+    /// enforce session, only when it is the socket's winning terminal: a
+    /// close another reason or a cancellation already chose records nothing.
     fn publish_authorization_denied(
         &self,
         route: crate::nip_fi_session::NipFiWsRoute,
         frame_tx: Option<&mpsc::Sender<WsMessage>>,
+        enforce: fn(&crate::nip_fi_shadow::EnforceSession),
     ) {
         let slot = self
             .terminal_frame_tx
@@ -265,6 +269,11 @@ impl CommunityConnectionControl {
         });
         if !won {
             return;
+        }
+        if !self.cancel.is_cancelled() {
+            if let Some(session) = self.nip_fi_enforce() {
+                enforce(&session);
+            }
         }
         if let Some(tx) = frame_tx.or(slot.as_ref()) {
             let _ = tx.try_send(crate::nip_fi_session::denial_frame(
@@ -283,7 +292,21 @@ impl CommunityConnectionControl {
         frame_tx: &mpsc::Sender<WsMessage>,
         route: crate::nip_fi_session::NipFiWsRoute,
     ) {
-        self.publish_authorization_denied(route, Some(frame_tx));
+        self.publish_authorization_denied(route, Some(frame_tx), |_| {});
+    }
+
+    /// The lease deadline's denial: [`Self::deny_authorization`], recording
+    /// the enforce session's deadline when it is the winning terminal.
+    pub(crate) fn expire_authorization(
+        &self,
+        frame_tx: &mpsc::Sender<WsMessage>,
+        route: crate::nip_fi_session::NipFiWsRoute,
+    ) {
+        self.publish_authorization_denied(
+            route,
+            Some(frame_tx),
+            crate::nip_fi_shadow::EnforceSession::expire,
+        );
     }
 
     /// Denial transition for `ConnectionManager::disconnect_nip_fi`: the shared
@@ -293,6 +316,7 @@ impl CommunityConnectionControl {
         self.publish_authorization_denied(
             crate::nip_fi_session::NipFiWsRoute::Root,
             Some(frame_tx),
+            crate::nip_fi_shadow::EnforceSession::revoke,
         );
         self.cancel.cancel();
     }
@@ -301,7 +325,11 @@ impl CommunityConnectionControl {
     /// handler's own denials: the shared transition on the sender registered
     /// by `set_terminal_frame_sender`, then cancels.
     pub(crate) fn disconnect_nip_fi(&self) {
-        self.publish_authorization_denied(crate::nip_fi_session::NipFiWsRoute::Audio, None);
+        self.publish_authorization_denied(
+            crate::nip_fi_session::NipFiWsRoute::Audio,
+            None,
+            crate::nip_fi_shadow::EnforceSession::revoke,
+        );
         self.cancel.cancel();
     }
 
@@ -320,7 +348,11 @@ impl CommunityConnectionControl {
             .read()
             .is_ok_and(|id| id.as_ref().is_some_and(|id| id.nip_fi.is_some()));
         if nip_fi {
-            self.publish_authorization_denied(crate::nip_fi_session::NipFiWsRoute::Audio, None);
+            self.publish_authorization_denied(
+                crate::nip_fi_session::NipFiWsRoute::Audio,
+                None,
+                |_| {},
+            );
         } else {
             self.reason_tx.send_if_modified(|current| {
                 current.is_none() && {
@@ -463,9 +495,6 @@ impl CommunityConnectionRegistry {
                 .unwrap_or(false);
             if matches {
                 let control = &entry.value().1;
-                if let Some(session) = control.nip_fi_enforce() {
-                    session.revoke();
-                }
                 control.disconnect_nip_fi();
                 closed += 1;
             }
@@ -980,9 +1009,6 @@ impl ConnectionManager {
                 .unwrap_or(false);
             if matches {
                 // Winner-only enqueue on the terminal channel, then cancel.
-                if let Some(session) = entry.community_control.nip_fi_enforce() {
-                    session.revoke();
-                }
                 entry
                     .community_control
                     .manager_disconnect_nip_fi(&entry.terminal_ctrl_tx);
@@ -3037,6 +3063,79 @@ pub(crate) mod tests {
                 Some(reason),
                 "{reason:?} (first writer) must not be clobbered by AuthorizationDenied"
             );
+        }
+    }
+
+    /// An enforced socket's NIP-FI end is recorded only by the terminal
+    /// transition that wins: a revocation (either registry's scan) or the
+    /// deadline after a community close or a cancellation records nothing,
+    /// while one that wins records its end once, even when a community close
+    /// follows. Mutation: dropping the cancellation guard in
+    /// `publish_authorization_denied` records an end for `Cancel`.
+    #[test]
+    fn enforce_end_is_recorded_only_by_the_winning_terminal() {
+        #[derive(Clone, Copy, Debug)]
+        enum First {
+            Community,
+            Cancel,
+            NipFi,
+        }
+        for nip_fi in ["root_scan", "audio_scan", "deadline"] {
+            let end = if nip_fi == "deadline" {
+                "ws end/expired"
+            } else {
+                "ws end/revoked"
+            };
+            for (first, expected) in [
+                (First::Community, &[][..]),
+                (First::Cancel, &[][..]),
+                (First::NipFi, &[end][..]),
+            ] {
+                let (records, lines, _, ()) =
+                    crate::nip_fi_shadow::tests::enforce_observed(async {}, |()| async move {
+                        let (terminal_tx, _terminal_rx) = tokio::sync::mpsc::channel(1);
+                        let cancel = CancellationToken::new();
+                        let control = CommunityConnectionControl::new(cancel.clone());
+                        control.set_terminal_frame_sender(terminal_tx.clone());
+                        let key = nostr::Keys::generate().public_key();
+                        control.attach_nip_fi_enforce(crate::nip_fi_shadow::EnforceSession::new(
+                            "ws",
+                            crate::nip_fi_shadow::BOUND.into(),
+                            Some(key),
+                        ));
+                        control.nip_fi_enforce().expect("attached").admit(key);
+                        let fi = || match nip_fi {
+                            "root_scan" => control.manager_disconnect_nip_fi(&terminal_tx),
+                            "audio_scan" => control.disconnect_nip_fi(),
+                            _ => control.expire_authorization(
+                                &terminal_tx,
+                                crate::nip_fi_session::NipFiWsRoute::Root,
+                            ),
+                        };
+                        match first {
+                            First::Community => {
+                                control.disconnect_community(
+                                    CommunityDisconnectReason::CommunityArchived,
+                                );
+                                fi();
+                            }
+                            First::Cancel => {
+                                cancel.cancel();
+                                fi();
+                            }
+                            First::NipFi => {
+                                fi();
+                                control.disconnect_community(
+                                    CommunityDisconnectReason::CommunityDeleted,
+                                );
+                            }
+                        }
+                    });
+                let admitted = records.iter().filter(|r| *r == "ws admit/admit").count();
+                assert_eq!(admitted, 1, "{nip_fi} {first:?}");
+                let ends: Vec<_> = records.iter().filter(|r| r.contains("end/")).collect();
+                assert_eq!(ends, expected, "{nip_fi} {first:?}: {lines:?}");
+            }
         }
     }
 

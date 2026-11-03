@@ -204,7 +204,8 @@ async fn nip_fi_assertion_guard(
     }
     match (verdict, community) {
         (Ok(()), Ok(community)) => {
-            crate::nip_fi_http::with_resolved_community(Ok(community), next.run(request)).await
+            let run = crate::nip_fi_http::with_resolved_community(Ok(community), next.run(request));
+            crate::nip_fi_http::with_enforce_verdict(run).await
         }
         (Err(deny), community) => {
             let label = crate::nip_fi_shadow::label(&community);

@@ -203,11 +203,8 @@ pub(crate) fn spawn_nip_fi_expiry_task(
             std::time::Duration::ZERO
         };
         let terminal = || {
-            control.deny_authorization(&terminal_ctrl_tx, route);
+            control.expire_authorization(&terminal_ctrl_tx, route);
             metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
-            if let Some(session) = control.nip_fi_enforce() {
-                session.expire();
-            }
             warn!(
                 route = ?route,
                 "NIP-FI session lease expired — closing connection"

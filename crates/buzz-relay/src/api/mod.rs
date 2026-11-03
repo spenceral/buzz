@@ -381,24 +381,10 @@ pub mod relay_members {
             cached_ban,
         )
         .await;
-        // An agent token's owner step ends its NIP-FI admission here, as
-        // shadow's verdict includes it: an owner-decided refusal is that
-        // verdict, anything else leaves the admission granted.
-        if token_owner.is_some() && state.config.nip_fi.mode.enforces() {
-            let community = crate::nip_fi_shadow::enforce_label(state, tenant.host());
-            match &result {
-                Err((refusal, Some(reason))) => crate::nip_fi_shadow::record_denial(
-                    "http",
-                    community,
-                    crate::nip_fi_shadow::WouldDeny::new(
-                        crate::nip_fi_shadow::Stage::Owner,
-                        refusal_class(refusal.0),
-                        reason,
-                    )
-                    .by(nostr::PublicKey::from_slice(pubkey_bytes).ok()),
-                ),
-                _ => crate::nip_fi_shadow::record_admit("http", &community),
-            }
+        // An agent token's owner-decided refusal is its request's NIP-FI
+        // verdict, as shadow's verdict includes it.
+        if let (Some(_), Err((refusal, Some(reason)))) = (token_owner, &result) {
+            crate::nip_fi_http::owner_refused(refusal_class(refusal.0), reason);
         }
         result.map_err(|(refusal, _)| match token_owner {
             None => MembershipRefusal::Api(refusal),

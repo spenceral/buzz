@@ -989,6 +989,7 @@ async fn run_active_audio_connection(
             let _owner_permit = match audio_gate.acquire_effect().await {
                 Ok(permit) => permit,
                 Err(crate::nip_fi_gate::SessionExpired) => {
+                    shadow_attempt.effect_refused(&audio_gate);
                     cancel.cancel();
                     if let Some(t) = _nip_fi_admission_expiry.take() {
                         let _ = t.await;
@@ -1123,6 +1124,7 @@ async fn run_active_audio_connection(
                 let _lease_permit = match audio_gate.acquire_effect().await {
                     Ok(permit) => permit,
                     Err(crate::nip_fi_gate::SessionExpired) => {
+                        shadow_attempt.effect_refused(&audio_gate);
                         cancel.cancel();
                         if let Some(t) = _nip_fi_admission_expiry.take() {
                             let _ = t.await;
@@ -1430,6 +1432,7 @@ async fn run_active_audio_connection(
         let _add_permit = match audio_gate.acquire_effect().await {
             Ok(p) => p,
             Err(crate::nip_fi_gate::SessionExpired) => {
+                shadow_attempt.effect_refused(&audio_gate);
                 // Expiry fired before we could add the peer. No peer, no commit.
                 // IMPORTANT 3 residual: await expiry task explicitly.
                 cancel.cancel();
@@ -3303,6 +3306,9 @@ async fn commit_participant_join(
         if let Some(shadow) = shadow {
             shadow.retire_pending();
         }
+        if let Some((session, _)) = enforce {
+            session.retire();
+        }
     };
     // 1. Sign the 48101 event synchronously.
     //
@@ -3536,6 +3542,11 @@ async fn commit_participant_join(
     let _permit = match gate.acquire_effect().await {
         Ok(permit) => permit,
         Err(crate::nip_fi_gate::SessionExpired) => {
+            // A deadline the gate saw first is claimed before the caller's
+            // refusal retirement; cancellation alone stays quiet.
+            if let Some((session, _)) = enforce.filter(|_| gate.deadline_passed()) {
+                session.expire();
+            }
             // Rollback explicitly — no 48101 or membership write committed.
             let _ = tx.rollback().await;
             return Err(JoinCommitError::Expired);
@@ -8542,6 +8553,113 @@ mod tests {
                     records, expected,
                     "capacity {capacity}, archived {archived}"
                 );
+            }
+        }
+
+        /// Enforce's audio verdict is the join commit, as shadow's is: a
+        /// committed join counts its admit before publication, so a deadline
+        /// after it ends the session `expired` with no pending denial; a join
+        /// refused for an ordinary reason (archived) retires the session
+        /// before its rollback, so an expiry held inside that rollback records
+        /// nothing; and a deadline the commit's effect gate sees first is
+        /// recorded once, as `session_deadline`, however often expiry follows.
+        /// Mutations: dropping enforce from `retire_shadow` records
+        /// `audio deadline/rejected` for `Archived`; dropping the commit
+        /// seam's `session.expire()` records nothing for `GateFirst`;
+        /// dropping the commit's admit records `audio deadline/rejected` for
+        /// `Committed`.
+        #[test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        fn enforce_join_commit_is_the_audio_admission() {
+            #[derive(Clone, Copy, Debug, PartialEq)]
+            enum Case {
+                Committed,
+                Archived,
+                GateFirst,
+            }
+            for (case, expected) in [
+                (
+                    Case::Committed,
+                    &["audio admit/admit", "audio end/expired"][..],
+                ),
+                (Case::Archived, &[][..]),
+                (Case::GateFirst, &["audio deadline/rejected"][..]),
+            ] {
+                let (records, lines, _, ()) =
+                    crate::nip_fi_shadow::tests::enforce_observed(async {}, |()| async move {
+                        let state = audio_test_state_real_db()
+                            .await
+                            .expect("postgres-ci provides a database");
+                        let pool = state.db.pool().clone();
+                        let (tenant, channel_id, member) = seed_audio_fixture(&pool).await;
+                        if case == Case::Archived {
+                            sqlx::query("UPDATE channels SET archived_at = NOW() WHERE id = $1")
+                                .bind(channel_id)
+                                .execute(&pool)
+                                .await
+                                .expect("archive channel");
+                        }
+                        let key = member.public_key();
+                        let session = crate::nip_fi_shadow::EnforceSession::new(
+                            "audio",
+                            crate::nip_fi_shadow::BOUND.into(),
+                            Some(key),
+                        );
+                        let deadline = match case {
+                            Case::GateFirst => chrono::Utc::now() - chrono::Duration::seconds(1),
+                            _ => chrono::Utc::now() + chrono::Duration::hours(1),
+                        };
+                        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(
+                            deadline,
+                            CancellationToken::new(),
+                        );
+                        let (arrived, release) =
+                            crate::nip_fi_test_hooks::join_refusal_rollback_hook::arm(
+                                tenant.community(),
+                            );
+                        let held = async {
+                            if case == Case::Archived {
+                                arrived.await.expect("the join is refused");
+                                session.expire();
+                                release.notify_one();
+                            }
+                        };
+                        let commit = async {
+                            commit_participant_join(
+                                &state,
+                                &tenant,
+                                channel_id,
+                                channel_id,
+                                &key.to_hex(),
+                                &key.to_bytes(),
+                                uuid::Uuid::new_v4(),
+                                0,
+                                0,
+                                1,
+                                "1",
+                                &MembershipAdmission::Existing {
+                                    parent_channel_id: channel_id,
+                                },
+                                &gate,
+                                &Arc::new(crate::audio::room::Room::new(
+                                    tenant.community(),
+                                    channel_id,
+                                )),
+                                None,
+                                None,
+                                Some((&session, key)),
+                            )
+                            .await
+                        };
+                        let (committed, ()) = tokio::join!(commit, held);
+                        assert_eq!(committed.is_ok(), case == Case::Committed, "{committed:?}");
+                        // The caller's refusal retirement, then a later expiry.
+                        if committed.is_err() {
+                            session.retire();
+                        }
+                        session.expire();
+                    });
+                assert_eq!(records, expected, "{case:?}: {lines:?}");
             }
         }
 

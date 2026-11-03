@@ -77,6 +77,14 @@ pub(crate) async fn community_ban_verdict(
     cached: bool,
 ) -> BanVerdict {
     let verdict = principal_ban_verdict(state, community, &pubkey, cached).await;
+    // A failed read leaves a token owner unchecked too: the refusal is that
+    // owner's unavailable ban state, as shadow's owner read would record.
+    if verdict.outcome == BanOutcome::DbError && token_owner.is_some() {
+        return BanVerdict {
+            source: BanSource::Owner,
+            ..verdict
+        };
+    }
     if verdict.outcome != BanOutcome::Clear {
         return verdict;
     }
@@ -801,7 +809,10 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             crate::nip_fi_test_hooks::before_auth_commit(conn.tenant.community()).await;
             let _auth_permit = match conn.nip_fi_gate.acquire_effect().await {
                 Ok(permit) => permit,
-                Err(crate::nip_fi_gate::SessionExpired) => return,
+                Err(crate::nip_fi_gate::SessionExpired) => {
+                    _shadow_attempt.effect_refused(&conn.nip_fi_gate);
+                    return;
+                }
             };
 
             // Record the NIP-OA owner link before admission: revoking the
@@ -2064,6 +2075,278 @@ mod tests {
                 });
                 assert!(ok_true, "{case:?}: shadow admits as Off");
                 assert_eq!(records, [expected], "{case:?}");
+            }
+        }
+
+        /// An enforced root socket in `community` under `assertion`, with its
+        /// enforce lifecycle attached as the upgrade attaches it, and an AUTH
+        /// event `signer` signs for it.
+        fn enforce_root_conn(
+            community: buzz_core::tenant::CommunityId,
+            assertion: buzz_auth::VerifiedAssertion,
+            signer: &Keys,
+        ) -> (crate::connection::tests::TestConn, nostr::Event) {
+            enforce_root_conn_gated(community, assertion, signer, None)
+        }
+
+        /// [`enforce_root_conn`] whose effect gate has `deadline`.
+        fn enforce_root_conn_gated(
+            community: buzz_core::tenant::CommunityId,
+            assertion: buzz_auth::VerifiedAssertion,
+            signer: &Keys,
+            deadline: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> (crate::connection::tests::TestConn, nostr::Event) {
+            let challenge = "enforce-root-challenge".to_owned();
+            let pending = AuthState::Pending {
+                challenge: challenge.clone(),
+                started_at: Instant::now(),
+            };
+            let asserted = assertion.asserted_key();
+            let t = crate::connection::tests::test_conn_gated(
+                pending,
+                Some(assertion),
+                community,
+                deadline,
+            );
+            t.conn.community_control.attach_nip_fi_enforce(
+                crate::nip_fi_shadow::EnforceSession::new(
+                    "ws",
+                    crate::nip_fi_shadow::BOUND.into(),
+                    asserted,
+                ),
+            );
+            let event = EventBuilder::new(Kind::Authentication, "")
+                .tag(Tag::parse(["relay", "ws://test.local"]).unwrap())
+                .tag(Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(signer)
+                .unwrap();
+            (t, event)
+        }
+
+        /// Runs the production expiry worker for `t`'s socket with its
+        /// deadline already passed, to completion.
+        async fn run_expiry_worker(t: &crate::connection::tests::TestConn) {
+            let gate = crate::nip_fi_gate::SessionAdmissionGate::new(
+                chrono::Utc::now(),
+                t.conn.cancel.clone(),
+            );
+            crate::nip_fi_session::spawn_nip_fi_expiry_task(
+                chrono::Utc::now(),
+                gate,
+                t.conn.community_control.clone(),
+                t.conn.terminal_ctrl_tx.clone(),
+                crate::nip_fi_session::NipFiWsRoute::Root,
+            )
+            .await
+            .expect("expiry worker");
+        }
+
+        /// Enforce records each root owner refusal once, with shadow's
+        /// reason, from the single ban decision that refused it: a stored
+        /// owner's ban (the agent's own read cascades to it) costs exactly
+        /// one authorization read, so a reread cannot change the reason. An
+        /// admitted session counts one admit and, through the real expiry
+        /// worker, one `expired` end and no pending `deadline`.
+        /// Mutations: deleting root's `session.admit(pubkey)` leaves `Clean`
+        /// with no record (the attempt retires it); reverting to reread the owner
+        /// after the refusal raises `StoredOwnerBanned`'s reads above 1.
+        #[test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        fn enforce_root_auth_records_owner_refusals_from_one_decision() {
+            use crate::nip_fi_shadow_session::tests::owned_assertion;
+            #[derive(Clone, Copy, Debug)]
+            enum Case {
+                Clean,
+                BannedTokenOwner,
+                StoredOwnerBanned,
+                OtherStoredOwner,
+                BanReadFails,
+            }
+            for (case, expected, reason, reads) in [
+                (
+                    Case::Clean,
+                    &["ws admit/admit", "ws end/expired"][..],
+                    None,
+                    None,
+                ),
+                (
+                    Case::BannedTokenOwner,
+                    &["ws owner/denied"][..],
+                    Some("owner_banned"),
+                    Some(2),
+                ),
+                (
+                    Case::StoredOwnerBanned,
+                    &["ws owner/denied"][..],
+                    Some("owner_banned"),
+                    Some(1),
+                ),
+                (
+                    Case::OtherStoredOwner,
+                    &["ws owner/denied"][..],
+                    Some("not_stored_owner"),
+                    None,
+                ),
+                (
+                    Case::BanReadFails,
+                    &["ws owner/unavailable"][..],
+                    Some("owner_ban_unavailable"),
+                    None,
+                ),
+            ] {
+                let (records, lines, auth_reads, ok_true) =
+                    crate::nip_fi_shadow::tests::enforce_observed(
+                        async {
+                            let state = auth_test_state_real_db_expect().await;
+                            let (agent, owner) = (Keys::generate(), Keys::generate());
+                            let community = seeded_community(&state).await;
+                            let link = |stored: nostr::PublicKey| {
+                                let state = std::sync::Arc::clone(&state);
+                                let agent = agent.public_key();
+                                async move {
+                                    for key in [agent, stored] {
+                                        state
+                                            .db
+                                            .ensure_user(community, key.as_bytes())
+                                            .await
+                                            .expect("ensure user");
+                                    }
+                                    assert!(state
+                                        .db
+                                        .set_agent_owner(
+                                            community,
+                                            agent.as_bytes(),
+                                            stored.as_bytes()
+                                        )
+                                        .await
+                                        .expect("seed stored owner"));
+                                }
+                            };
+                            let ban = |key: nostr::PublicKey| {
+                                let state = std::sync::Arc::clone(&state);
+                                async move {
+                                    let bytes = key.to_bytes();
+                                    state
+                                        .db
+                                        .ban_community_member(community, &bytes, &bytes, None, None)
+                                        .await
+                                        .expect("ban owner");
+                                }
+                            };
+                            match case {
+                                Case::Clean => {}
+                                Case::BannedTokenOwner => ban(owner.public_key()).await,
+                                Case::StoredOwnerBanned => {
+                                    link(owner.public_key()).await;
+                                    ban(owner.public_key()).await;
+                                }
+                                Case::OtherStoredOwner => link(Keys::generate().public_key()).await,
+                                // The agent's own ban read fails: its token
+                                // owner is left unchecked, so the refusal is the
+                                // owner's unavailable ban state.
+                                Case::BanReadFails => state.db.pool().close().await,
+                            }
+                            let conn = enforce_root_conn(
+                                community,
+                                owned_assertion(agent.public_key(), owner.public_key()),
+                                &agent,
+                            );
+                            (state, conn)
+                        },
+                        |(state, (mut t, event))| async move {
+                            handle_auth(event, std::sync::Arc::clone(&t.conn), state).await;
+                            let mut ok_true = false;
+                            while let Ok(WsMessage::Text(text)) = t.send_rx.try_recv() {
+                                ok_true |= is_ok_true(text.as_str());
+                            }
+                            run_expiry_worker(&t).await;
+                            ok_true
+                        },
+                    );
+                assert_eq!(records, expected, "{case:?}: {lines:?}");
+                assert_eq!(ok_true, reason.is_none(), "{case:?}: admission unchanged");
+                let denials: Vec<_> = lines
+                    .iter()
+                    .filter(|l| l.contains("enforce deny"))
+                    .collect();
+                match reason {
+                    Some(reason) => {
+                        assert_eq!(denials.len(), 1, "{case:?}: {lines:?}");
+                        assert!(
+                            denials[0].contains(&format!("reason=\"{reason}\"")),
+                            "{case:?}: {lines:?}"
+                        );
+                        assert!(
+                            denials[0].contains("stage=\"owner\""),
+                            "{case:?}: {lines:?}"
+                        );
+                        assert!(denials[0].contains("route=\"ws\""), "{case:?}: {lines:?}");
+                    }
+                    None => assert!(denials.is_empty(), "{case:?}: {lines:?}"),
+                }
+                if let Some(reads) = reads {
+                    assert_eq!(auth_reads, reads, "{case:?}: authorization reads");
+                }
+            }
+        }
+
+        /// A deadline the AUTH commit's effect gate sees before the expiry
+        /// worker runs is recorded once, as the pending session's
+        /// `session_deadline` denial: in either order, the attempt's own
+        /// retirement cannot end it unrecorded, and the worker that follows
+        /// adds nothing. Admission is unchanged: no `OK true`.
+        /// Mutation: deleting root's `effect_refused` call records nothing
+        /// for `GateFirst`.
+        #[test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        fn enforce_root_deadline_seen_by_the_gate_first_is_recorded_once() {
+            for worker_first in [false, true] {
+                let (records, lines, _, ok_true) = crate::nip_fi_shadow::tests::enforce_observed(
+                    async {
+                        let state = auth_test_state_real_db_expect().await;
+                        let agent = Keys::generate();
+                        let community = seeded_community(&state).await;
+                        state
+                            .db
+                            .ensure_user(community, agent.public_key().as_bytes())
+                            .await
+                            .expect("ensure user");
+                        let conn = enforce_root_conn_gated(
+                            community,
+                            buzz_auth::VerifiedAssertion::for_test(
+                                Some(agent.public_key()),
+                                vec![chrono::Utc::now() + chrono::Duration::hours(1)],
+                            ),
+                            &agent,
+                            Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+                        );
+                        (state, conn)
+                    },
+                    |(state, (mut t, event))| async move {
+                        if worker_first {
+                            run_expiry_worker(&t).await;
+                        }
+                        handle_auth(event, std::sync::Arc::clone(&t.conn), state).await;
+                        run_expiry_worker(&t).await;
+                        let mut ok_true = false;
+                        while let Ok(WsMessage::Text(text)) = t.send_rx.try_recv() {
+                            ok_true |= is_ok_true(text.as_str());
+                        }
+                        ok_true
+                    },
+                );
+                assert_eq!(
+                    records,
+                    ["ws deadline/rejected"],
+                    "worker_first={worker_first}: {lines:?}"
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("reason=\"session_deadline\"")),
+                    "{lines:?}"
+                );
+                assert!(!ok_true, "admission unchanged");
             }
         }
 

@@ -284,6 +284,18 @@ impl<'a> AuthAttempt<'a> {
     }
 }
 
+impl AuthAttempt<'_> {
+    /// An effect permit refused at `gate`: when its deadline has passed, the
+    /// gate saw the expiry before the expiry worker could, so the enforce
+    /// session claims that deadline outcome now, before this attempt's
+    /// retirement could end it unrecorded. Cancellation alone stays quiet.
+    pub(crate) fn effect_refused(&self, gate: &crate::nip_fi_gate::SessionAdmissionGate) {
+        if let Some(session) = self.0.nip_fi_enforce().filter(|_| gate.deadline_passed()) {
+            session.expire();
+        }
+    }
+}
+
 impl Drop for AuthAttempt<'_> {
     fn drop(&mut self) {
         self.refused();
@@ -520,6 +532,65 @@ pub(crate) mod tests {
         match crate::api::nip_fi::apply_nip_fi_disconnect(state, &msg, Utc::now()) {
             crate::api::nip_fi::NipFiDisconnectApplyResult::Applied(merged) => merged,
             other => panic!("disconnect not applied: {other:?}"),
+        }
+    }
+
+    /// Audio's owner-link refusal is recorded through the same admission
+    /// seam root uses (`owner_link_denial` → `record_enforce_refusal`), on
+    /// route `audio`, with root's reasons: a conflicting stored owner is
+    /// `not_stored_owner`, an unwritable link `owner_link_unavailable`; a
+    /// NIP-OA (non-token) link failure is no owner verdict and retires.
+    /// Mutation: dropping `owner_reason` from `owner_link_denial` records
+    /// nothing for the token cases.
+    #[test]
+    fn audio_owner_link_refusal_shares_roots_seam_and_reasons() {
+        use crate::api::relay_members::OwnerLink;
+        for (link, token, expected, reason) in [
+            (
+                OwnerLink::Conflict,
+                true,
+                &["audio owner/denied"][..],
+                Some("not_stored_owner"),
+            ),
+            (
+                OwnerLink::Unavailable,
+                true,
+                &["audio owner/unavailable"][..],
+                Some("owner_link_unavailable"),
+            ),
+            (OwnerLink::Unavailable, false, &[][..], None),
+        ] {
+            let (records, lines, _, ()) =
+                crate::nip_fi_shadow::tests::enforce_observed(async {}, |()| async move {
+                    let (agent, owner) = (
+                        nostr::Keys::generate().public_key(),
+                        nostr::Keys::generate().public_key(),
+                    );
+                    let control = crate::state::CommunityConnectionControl::new(
+                        tokio_util::sync::CancellationToken::new(),
+                    );
+                    control.attach_nip_fi_enforce(crate::nip_fi_shadow::EnforceSession::new(
+                        "audio",
+                        crate::nip_fi_shadow::BOUND.into(),
+                        Some(agent),
+                    ));
+                    let denial = crate::handlers::auth::owner_link_denial(link, token);
+                    assert!(denial.is_some(), "{link:?} refuses");
+                    crate::handlers::auth::record_enforce_refusal(
+                        &control,
+                        denial.as_ref(),
+                        Some(&owned_assertion(agent, owner)),
+                    );
+                });
+            assert_eq!(records, expected, "{link:?} token={token}: {lines:?}");
+            if let Some(reason) = reason {
+                assert!(
+                    lines.len() == 1
+                        && lines[0].contains(&format!("reason=\"{reason}\""))
+                        && lines[0].contains("route=\"audio\""),
+                    "{lines:?}"
+                );
+            }
         }
     }
 
