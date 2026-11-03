@@ -272,7 +272,7 @@ impl CommunityConnectionControl {
         }
         if !self.cancel.is_cancelled() {
             if let Some(session) = self.nip_fi_enforce() {
-                enforce(&session);
+                enforce(session);
             }
         }
         if let Some(tx) = frame_tx.or(slot.as_ref()) {
