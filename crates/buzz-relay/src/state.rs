@@ -110,6 +110,8 @@ pub(crate) struct CommunityConnectionControl {
     nip_fi_shadow: Arc<std::sync::OnceLock<Arc<crate::nip_fi_shadow_session::ShadowSession>>>,
     /// A shadow upgrade would-deny's line, owned by the connection task.
     nip_fi_line: Arc<std::sync::OnceLock<std::sync::Weak<crate::nip_fi_shadow::PendingLine>>>,
+    /// An enforced NIP-FI session's labels for its expiry record.
+    nip_fi_enforce: Arc<std::sync::OnceLock<crate::nip_fi_shadow::EnforceSession>>,
 }
 
 impl CommunityConnectionControl {
@@ -124,6 +126,7 @@ impl CommunityConnectionControl {
             owner: Arc::default(),
             nip_fi_shadow: Arc::default(),
             nip_fi_line: Arc::default(),
+            nip_fi_enforce: Arc::default(),
         }
     }
 
@@ -136,6 +139,26 @@ impl CommunityConnectionControl {
         if let Some(session) = session {
             session.fence(self.cancel.clone());
             let _ = self.nip_fi_shadow.set(session);
+        }
+    }
+
+    /// Labels the socket's enforced NIP-FI session for its expiry record.
+    pub(crate) fn attach_nip_fi_enforce(&self, session: crate::nip_fi_shadow::EnforceSession) {
+        let _ = self.nip_fi_enforce.set(session);
+    }
+
+    /// Marks the enforced session admitted for `pubkey`.
+    pub(crate) fn admit_nip_fi_enforce(&self, pubkey: nostr::PublicKey) {
+        if let Some(session) = self.nip_fi_enforce.get() {
+            session.admit(pubkey);
+        }
+    }
+
+    /// Records the enforced session's deadline: a pending session's denial,
+    /// else an admitted session's end.
+    pub(crate) fn record_nip_fi_expiry(&self, route: &'static str) {
+        if let Some(session) = self.nip_fi_enforce.get() {
+            session.expire(route);
         }
     }
 

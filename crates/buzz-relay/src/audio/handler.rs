@@ -272,6 +272,12 @@ pub(crate) async fn handle_audio_connection(
     let (pre_terminal_ctrl_tx, pre_terminal_ctrl_rx) =
         tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
     let control = CommunityConnectionControl::new(cancel);
+    if let Some(assertion) = &nip_fi_assertion {
+        control.attach_nip_fi_enforce(crate::nip_fi_shadow::EnforceSession::new(
+            crate::nip_fi_shadow::enforce_label(&state, tenant.host()),
+            assertion.asserted_key(),
+        ));
+    }
     control.attach_nip_fi_shadow(nip_fi_shadow);
     // Its first verified AUTH writes it; else the read loop's end does.
     let shadow_line = shadow_line.map(Arc::new);
@@ -874,6 +880,10 @@ async fn run_active_audio_connection(
     if let Some(denial) = crate::handlers::auth::ban_admission_denial(early_ban) {
         shadow_attempt.refused();
         warn!(channel_id = %channel_id, pubkey = %pubkey_hex, reason = denial.reason, "audio: denied at ban check");
+        if nip_fi_assertion.is_some() {
+            crate::handlers::auth::record_owner_ban(&state, &tenant, "audio", pubkey, token_owner)
+                .await;
+        }
         exit_authorization_refusal(
             &mut ws_send,
             &control,
@@ -1681,6 +1691,7 @@ async fn run_active_audio_connection(
     }
     match committed {
         Ok(CommitJoinOutcome::JoinedSent(msg)) => {
+            control.admit_nip_fi_enforce(pubkey);
             // Bootstrap prepared inside the permit; assigned here for ordered
             // write to `ctrl_tx` after it is created below, before task spawns.
             bootstrap_joined_msg = msg;

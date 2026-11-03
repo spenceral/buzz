@@ -26,7 +26,7 @@
 //! |---|---|---|
 //! | `buzz_nip_fi_shadow_total` | `route` (`http`, `ws`, `audio`), `stage`, `outcome`, `community` | NIP-FI decision enforce would make: one per HTTP request that reaches admission, one per WebSocket upgrade enforce would refuse, and one per observed session: at the AUTH where enforce would admit or deny it, or `deadline` when its deadline passes first. A request or upgrade whose community binding goes stale before enforce's final re-check also records `deadline`. An agent assertion enforce would refuse for its token owner, banned or not the agent's stored owner, records `owner` |
 //! | `buzz_nip_fi_enforce_denied_total` | as `buzz_nip_fi_shadow_total` | NIP-FI denial enforce returns: at the upgrade (community, assertion, deny set, stale binding), at the router guard and HTTP admission, and at AUTH (pairing, post-registration deny set). Its line is `nip-fi enforce deny`, written at once |
-//! | `buzz_nip_fi_enforce_session_end_total` | `route` (`ws`, `audio`), `reason` (`expired`) | enforce session its deadline closed. Its line is `nip-fi enforce session end` |
+//! | `buzz_nip_fi_enforce_session_end_total` | as `buzz_nip_fi_shadow_session_end_total` | admitted enforce session its deadline closed; a pending one records the `deadline` denial instead. Its line is `nip-fi enforce session end`, with the admitted key |
 //! | `buzz_nip_fi_shadow_strict_proof_total` | `route` (`bridge`, `blossom`), `outcome` (`pass`, `rejected`), `community` | strict NIP-98 side check on a route whose proof is stricter in enforce (payload tag, Blossom proof); not every request runs one |
 //! | `buzz_nip_fi_shadow_session_end_total` | `route` (`ws`, `audio`), `reason` (`expired`, `revoked`), `community` | admitted shadow session enforce would have ended; a session never admitted records none |
 //! | `buzz_nip_fi_shadow_disconnect_total` | `route` (`admin`, `cross_pod`), `outcome` | disconnect-path event that moves a real disconnect counter in enforce: an accepted admin command, a capacity rejection, a subscriber lag, or a cross-pod capacity or poison failsafe. An admin command refused for its header, body, proof, replay, or a dependency error records nothing |
@@ -189,7 +189,7 @@ pub(crate) fn record_pending(
 /// ends before any later proof, so nothing waits for one.
 pub(crate) fn record_denial(route: &'static str, community: SharedString, deny: WouldDeny) {
     metrics::counter!(
-        "buzz_nip_fi_shadow_total",
+        "buzz_nip_fi_enforce_denied_total",
         "route" => route,
         "stage" => deny.stage.label(),
         "outcome" => class_label(deny.class),
@@ -199,21 +199,55 @@ pub(crate) fn record_denial(route: &'static str, community: SharedString, deny: 
     PendingLine::new(Mode::Enforce, route, community, deny).finish();
 }
 
-/// Record an admitted enforce session its deadline ended, as
-/// `buzz_nip_fi_shadow_session_end_total` records the one shadow would end.
-pub(crate) fn record_session_end(route: &'static str, reason: &'static str) {
-    metrics::counter!(
-        "buzz_nip_fi_enforce_session_end_total",
-        "route" => route,
-        "reason" => reason
-    )
-    .increment(1);
-    tracing::info!(
-        mode = "enforce",
-        route,
-        reason,
-        "nip-fi enforce session end"
-    );
+/// An enforced socket's community label and asserted key, and the key its
+/// AUTH admitted, so its deadline records as shadow's session does.
+pub(crate) struct EnforceSession {
+    community: SharedString,
+    asserted: Option<PublicKey>,
+    admitted: std::sync::OnceLock<PublicKey>,
+}
+
+impl EnforceSession {
+    pub(crate) fn new(community: SharedString, asserted: Option<PublicKey>) -> Self {
+        Self {
+            community,
+            asserted,
+            admitted: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn admit(&self, pubkey: PublicKey) {
+        let _ = self.admitted.set(pubkey);
+    }
+
+    /// The deadline: a pending session records the `session_deadline`
+    /// denial shadow records; an admitted one its `expired` end.
+    pub(crate) fn expire(&self, route: &'static str) {
+        let Some(pubkey) = self.admitted.get() else {
+            let deny = WouldDeny::new(
+                Stage::Deadline,
+                DenialClass::EvidenceRejected,
+                "session_deadline",
+            );
+            record_denial(route, self.community.clone(), deny.by(self.asserted));
+            return;
+        };
+        metrics::counter!(
+            "buzz_nip_fi_enforce_session_end_total",
+            "route" => route,
+            "reason" => "expired",
+            "community" => self.community.clone()
+        )
+        .increment(1);
+        tracing::info!(
+            mode = "enforce",
+            route,
+            reason = "expired",
+            pubkey = pubkey.to_hex(),
+            community = %self.community,
+            "nip-fi enforce session end"
+        );
+    }
 }
 
 /// [`record_denial`] for enforce's key-pairing refusal of `pubkey`, the
@@ -797,6 +831,50 @@ pub(crate) mod tests {
         assert!(lines[0].contains("reason=\"key_mismatch\""), "{lines:?}");
         assert!(lines[1].contains("reason=\"no_asserted_key\""), "{lines:?}");
         assert_eq!(counts.len(), 2);
+    }
+
+    // A pending session's deadline records the `deadline` denial with the
+    // asserted key; an admitted one its `expired` end with the admitted key
+    // and community. Mutation: dropping the admitted branch, or the
+    // community label → RED.
+    #[tokio::test(flavor = "current_thread")]
+    async fn enforce_session_expiry_tells_pending_from_admitted() {
+        let asserted = nostr::Keys::generate().public_key();
+        let admitted = nostr::Keys::generate().public_key();
+        let recorder = DebuggingRecorder::new();
+        let log = WouldDenyLog::capture();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            super::EnforceSession::new("c".into(), Some(asserted)).expire("ws");
+            let session = super::EnforceSession::new("c".into(), Some(asserted));
+            session.admit(admitted);
+            session.expire("audio");
+        }
+        let denies = log.enforce_lines();
+        assert_eq!(denies.len(), 1, "{denies:?}");
+        assert!(denies[0].contains("reason=\"session_deadline\""));
+        assert!(denies[0].contains(&format!("pubkey=\"{}\"", asserted.to_hex())));
+        let ends = log.lines_of("nip-fi enforce session end");
+        assert_eq!(ends.len(), 1, "{ends:?}");
+        assert!(ends[0].contains(" INFO ") && ends[0].contains("community=c"));
+        assert!(ends[0].contains(&admitted.to_hex()), "{ends:?}");
+        let mut names = Vec::new();
+        for (key, _, _, _) in recorder.snapshotter().snapshot().into_vec() {
+            let key = key.key();
+            let labels: Vec<_> = key
+                .labels()
+                .map(|l| format!("{}={}", l.key(), l.value()))
+                .collect();
+            names.push(format!("{} {}", key.name(), labels.join(",")));
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "buzz_nip_fi_enforce_denied_total route=ws,stage=deadline,outcome=rejected,community=c",
+                "buzz_nip_fi_enforce_session_end_total route=audio,reason=expired,community=c",
+            ]
+        );
     }
 
     /// The counted line of a `route` upgrade would-deny for a missing
